@@ -6,12 +6,13 @@ import (
 	"net"
 	"sync"
 	"time"
+	"github.com/Masterminds/glide/path"
 )
 
 type TCPServerConfig struct {
 	Addr             string
-	NewAgent         func(*TCPConnection) Agent
-	MsgCodec         MessageReaderWriter
+	NewAgent         func(connection *TCPConnection) Agent
+	MsgCodec         MessageCodec
 	PenddingMsgCount int
 	MaxConnCount     int
 }
@@ -66,8 +67,8 @@ func NewServer(config *TCPServerConfig) (*TCPServer, error) {
 	return s, nil
 }
 
-// Run : run the server
-func (s *TCPServer) Run() {
+// Serve : block run the server
+func (s *TCPServer) Serve() {
 	s.listenerWG.Add(1)
 	defer s.listenerWG.Done()
 
@@ -97,15 +98,17 @@ func (s *TCPServer) Run() {
 		s.connsWG.Add(1)
 		agent := s.config.NewAgent(tcpConn)
 		go func() {
-			agent.Run()
+			defer s.connsWG.Done()
 
+			agent.Init()
+			agent.Run()
 			agent.Destroy()
+
 			tcpConn.Close()
+
 			s.connsLock.Lock()
 			delete(s.connsMap, tcpConn)
 			s.connsLock.Unlock()
-
-			s.connsWG.Done()
 		}()
 	}
 }

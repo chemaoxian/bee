@@ -7,17 +7,20 @@ import (
 	"log"
 	"math"
 	"net"
+	"github.com/Masterminds/glide/dependency"
 )
 
-// DefaultMessageReaderWriter is a default message codec implement [header][data]
-type DefaultMessageReaderWriter struct {
+var _ MessageCodec = &DefaultMessageCodec{}
+
+// DefaultMessageCodec is a default message codec implement [header][data]
+type DefaultMessageCodec struct {
 	headerByteCount int
 	headerLenParser func([]byte) uint32
 	headerLenSaver  func(uint32, []byte)
 	maxMsgSize      uint32
 }
 
-func NewDefaultMessageReaderWriter(headerByteCount int, maxMsgSize uint32) (*DefaultMessageReaderWriter, error) {
+func NewDefaultMessageReaderWriter(headerByteCount int, maxMsgSize uint32) (*DefaultMessageCodec, error) {
 	var lenFunc func([]byte) uint32
 	var saveLenFunc func(uint32, []byte)
 	var maxSize uint32
@@ -42,7 +45,7 @@ func NewDefaultMessageReaderWriter(headerByteCount int, maxMsgSize uint32) (*Def
 		return nil, errors.New("invalid maxMsgSize")
 	}
 
-	codec := &DefaultMessageReaderWriter{
+	codec := &DefaultMessageCodec{
 		headerByteCount,
 		lenFunc,
 		saveLenFunc,
@@ -51,7 +54,7 @@ func NewDefaultMessageReaderWriter(headerByteCount int, maxMsgSize uint32) (*Def
 	return codec, nil
 }
 
-func (codec *DefaultMessageReaderWriter) Read(conn net.Conn) ([]byte, error) {
+func (codec *DefaultMessageCodec) Encodec(conn net.Conn) ([]byte, error) {
 
 	var headerBuf = make([]byte, codec.headerByteCount)
 	_, err := io.ReadFull(conn, headerBuf)
@@ -76,7 +79,7 @@ func (codec *DefaultMessageReaderWriter) Read(conn net.Conn) ([]byte, error) {
 	return dataBuf, nil
 }
 
-func (codec *DefaultMessageReaderWriter) Write(conn net.Conn, msg []byte) error {
+func (codec *DefaultMessageCodec) Decodec(conn net.Conn, msg []byte) error {
 	msgLen := uint32(len(msg))
 	if msgLen > codec.maxMsgSize {
 		return errors.New("invalid message: message too long")

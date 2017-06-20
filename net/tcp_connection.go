@@ -5,42 +5,54 @@ import (
 	"log"
 	"net"
 	"sync"
+	"github.com/Masterminds/glide/path"
+	"syscall"
+	"io"
+	"go/format"
 )
 
-// TCPConnection implete the conception of connect, read msg, write msg
+var (
+	ErrorConnectClosed = errors.New("connect is close")
+	ErrorNullMessage = errors.New("null message")
+	ErrorSendBlocked = errors.New("send queue full")
+)
+// TCPConnection implement the conception of connect, read msg, write msg
 type TCPConnection struct {
-	lock            sync.Mutex
-	conn            *net.TCPConn
-	closeFlag       bool
-	writeChan       chan []byte
-	msgReaderWriter MessageReaderWriter
+	waitGroup sync.WaitGroup
+	lock      sync.Mutex
+	conn      *net.TCPConn
+	closeChan chan bool
+	writeChan chan []byte
+	codec     MessageCodec
 }
 
-func newTCPConnection(conn *net.TCPConn, pendingMsgCount int, msgCodec MessageReaderWriter) *TCPConnection {
+func newTCPConnection(conn *net.TCPConn, pendingMsgCount int, msgCodec MessageCodec) *TCPConnection {
 	c := &TCPConnection{
-		conn:            conn,
-		closeFlag:       false,
-		writeChan:       make(chan []byte, pendingMsgCount),
-		msgReaderWriter: msgCodec,
+		conn:      conn,
+		closeChan: make(chan bool, 1),
+		writeChan: make(chan []byte, pendingMsgCount),
+		codec:     msgCodec,
 	}
 
+	c.waitGroup.Add(1)
 	go func() {
-		for msg := range c.writeChan {
-			if msg != nil {
-				err := c.msgReaderWriter.Write(c.conn, msg)
-				if err != nil {
-					log.Printf("send data occur error: %v, connection: %v", err, c.conn.RemoteAddr())
-					break
+		defer c.waitGroup.Done()
+		for {
+			select {
+			case msg, ok := <-c.writeChan:
+				if ok {
+					err := c.codec.Decodec(c.conn, msg)
+					if err != nil {
+						log.Printf("send data occur error: %v, connection: %v", err, c.conn.RemoteAddr())
+						c.Close()
+						return
+					}
 				}
-			} else {
-				break
+				case <-c.closeChan:
+					log.Printf("exit send go rutine, connection closed : %v", c.conn.RemoteAddr())
+					return
 			}
 		}
-
-		c.lock.Lock()
-		c.conn.Close()
-		c.closeFlag = true
-		c.lock.Unlock()
 	}()
 
 	return c
@@ -57,25 +69,44 @@ func (c *TCPConnection) RemoteAddr() net.Addr {
 }
 
 // SendMessage : send message to connection
-func (c *TCPConnection) SendMessage(message []byte) {
+func (c *TCPConnection) SendMessage(message []byte) error {
+	if message == nil {
+		return ErrorNullMessage
+	}
+
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if !c.closeFlag && message != nil {
-		c.doSendMessge(message)
+	if !c.IsClosed(){
+		select {
+		case c.writeChan <- message:
+			return nil
+		default:
+			log.Printf("connection %s send qeueue is full, close it", c.RemoteAddr())
+			c.Close()
+			return ErrorSendBlocked
+		}
+	} else {
+		return ErrorConnectClosed
 	}
 }
 
-// GetMessage : get message from connnection
 func (c *TCPConnection) GetMessage() ([]byte, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if !c.closeFlag {
-		return c.msgReaderWriter.Read(c.conn)
+	if !c.IsClosed() {
+		return nil, ErrorConnectClosed
 	}
 
-	return nil, errors.New("connect already close")
+	message, err := c.codec.Encodec(c.conn)
+	if err != nil {
+		log.Printf("get message failed: %v, connection: %v", err, c.conn.RemoteAddr())
+		c.Close()
+		return nil, err
+	}
+
+	return message, err
 }
 
 // Close : close tcp connection
@@ -83,34 +114,23 @@ func (c *TCPConnection) Close() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if !c.closeFlag {
-		c.doSendMessge(nil)
-		c.closeFlag = true
+	if !c.IsClosed() {
+		close(c.closeChan)
+
+		go func() {
+			log.Printf("exit connection : %v", c.conn.RemoteAddr())
+			c.waitGroup.Wait()
+			close(c.writeChan)
+			c.conn.Close()
+		}()
 	}
 }
 
-// Destroy : destroy tcp connection
-func (c *TCPConnection) Destroy() {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	c.doDestory()
-}
-
-func (c *TCPConnection) doSendMessge(message []byte) {
-	if len(c.writeChan) == cap(c.writeChan) {
-		log.Printf("close conn: send queue full")
-		c.doDestory()
-		return
-	}
-
-	c.writeChan <- message
-}
-
-func (c *TCPConnection) doDestory() {
-	if !c.closeFlag {
-		c.conn.Close()
-		close(c.writeChan)
-		c.closeFlag = true
+func (c *TCPConnection) IsClosed() bool {
+	select {
+	case <-c.closeChan:
+		return true
+	default:
+		return false
 	}
 }
