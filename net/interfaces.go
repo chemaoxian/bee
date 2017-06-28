@@ -10,9 +10,15 @@ type MessageCodec interface {
 	Decodec(net.Conn, []byte) error
 }
 
+type Message struct {
+	Content []byte
+	ConnectionId uint32
+	ServerId	uint32
+}
+
 // Agent is a delegate of the tcp connect which will run in a go rutine
 type Agent interface {
-	Init() bool
+	Init()
 	Run()
 	Destroy()
 }

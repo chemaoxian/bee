@@ -6,7 +6,8 @@ import (
 	"net"
 	"sync"
 	"time"
-	"github.com/Masterminds/glide/path"
+	"runtime"
+	"sync/atomic"
 )
 
 type TCPServerConfig struct {
@@ -25,7 +26,8 @@ type TCPServer struct {
 	listener   *net.TCPListener
 	connsLock  sync.Mutex
 	connsWG    sync.WaitGroup
-	connsMap   map[*TCPConnection]struct{}
+	connsMap   map[uint32]*TCPConnection
+	nextClientId uint32
 }
 
 // NewServer  new a server instance
@@ -62,7 +64,7 @@ func NewServer(config *TCPServerConfig) (*TCPServer, error) {
 	}
 
 	s.listener = listener
-	s.connsMap = make(map[*TCPConnection]struct{})
+	s.connsMap = make(map[uint32]*TCPConnection)
 
 	return s, nil
 }
@@ -91,14 +93,25 @@ func (s *TCPServer) Serve() {
 			conn.Close()
 			log.Println("max connection !!!")
 		}
-		tcpConn := newTCPConnection(conn, s.config.PenddingMsgCount, s.config.MsgCodec)
-		s.connsMap[tcpConn] = struct{}{}
+		id := s.genNextId()
+		tcpConn := newTCPConnection(id, conn, s.config.PenddingMsgCount, s.config.MsgCodec)
+		s.connsMap[id] = tcpConn
 		s.connsLock.Unlock()
 
-		s.connsWG.Add(1)
 		agent := s.config.NewAgent(tcpConn)
-		go func() {
-			defer s.connsWG.Done()
+		s.connsWG.Add(1)
+		go func(){
+			defer func () {
+				s.connsWG.Done()
+				tcpConn.Close()
+				if err :=recover(); err != nil {
+					buf := make([]byte, 1024)
+					runtime.Stack(buf, true)
+					log.Printf("agent crash : %s", buf)
+				}
+			}()
+
+			tcpConn.start()
 
 			agent.Init()
 			agent.Run()
@@ -107,7 +120,7 @@ func (s *TCPServer) Serve() {
 			tcpConn.Close()
 
 			s.connsLock.Lock()
-			delete(s.connsMap, tcpConn)
+			delete(s.connsMap, tcpConn.id)
 			s.connsLock.Unlock()
 		}()
 	}
@@ -119,11 +132,35 @@ func (s *TCPServer) Close() {
 	s.listenerWG.Wait()
 
 	s.connsLock.Lock()
-	for conn := range s.connsMap {
+	for _, conn := range s.connsMap {
 		conn.Close()
 	}
 	s.connsMap = nil
 	s.connsLock.Unlock()
 
 	s.connsWG.Wait()
+}
+
+func (me *TCPServer) genNextId() uint32 {
+	for {
+		nextId := atomic.AddUint32(&me.nextClientId, 1)
+
+		me.connsLock.Lock()
+		if _, ok := me.connsMap[nextId]; !ok {
+			me.connsLock.Unlock()
+			return nextId
+		}
+		me.connsLock.Unlock()
+	}
+}
+
+func (me *TCPServer) GetTCPConnection(id uint32) (*TCPConnection, error) {
+	me.connsLock.Lock()
+	defer me.connsLock.Unlock()
+
+	if conn, ok := me.connsMap[id]; ok {
+		return conn, nil
+	}
+
+	return nil, errors.New("connection not found")
 }

@@ -72,21 +72,16 @@ func (c *TCPClient) Run() {
 			continue
 		}
 
-		tcpConn := newTCPConnection(c.rawConn, c.conf.PenddingMsgCount, c.conf.MsgCodec)
+		tcpConn := newTCPConnection(0, c.rawConn, c.conf.PenddingMsgCount, c.conf.MsgCodec)
 		agent := c.conf.NewAgent(tcpConn)
 
-		if !agent.Init() {
-			tcpConn.Close()
+		tcpConn.start()
 
-			if !c.conf.AutoConnect && c.IsClose()  {
-				break
-			}
-			time.Sleep(c.conf.ConnectInterval)
-			continue
-		}
-
+		agent.Init()
 		agent.Run()
 		agent.Destroy()
+
+		tcpConn.Close()
 
 		if !c.conf.AutoConnect && c.IsClose() {
 			break

@@ -7,7 +7,6 @@ import (
 	"log"
 	"math"
 	"net"
-	"github.com/Masterminds/glide/dependency"
 )
 
 var _ MessageCodec = &DefaultMessageCodec{}

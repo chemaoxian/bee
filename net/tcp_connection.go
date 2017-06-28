@@ -5,17 +5,15 @@ import (
 	"log"
 	"net"
 	"sync"
-	"github.com/Masterminds/glide/path"
-	"syscall"
-	"io"
-	"go/format"
+	"github.com/lukehoban/ident"
 )
 
 var (
 	ErrorConnectClosed = errors.New("connect is close")
-	ErrorNullMessage = errors.New("null message")
-	ErrorSendBlocked = errors.New("send queue full")
+	ErrorNullMessage   = errors.New("null message")
+	ErrorSendBlocked   = errors.New("send queue full")
 )
+
 // TCPConnection implement the conception of connect, read msg, write msg
 type TCPConnection struct {
 	waitGroup sync.WaitGroup
@@ -23,41 +21,71 @@ type TCPConnection struct {
 	conn      *net.TCPConn
 	closeChan chan bool
 	writeChan chan []byte
+	sendChan chan []byte
 	codec     MessageCodec
+	id 		uint32
 }
 
-func newTCPConnection(conn *net.TCPConn, pendingMsgCount int, msgCodec MessageCodec) *TCPConnection {
-	c := &TCPConnection{
+func newTCPConnection( id uint32,
+						conn *net.TCPConn,
+						pendingMsgCount int,
+						msgCodec MessageCodec) *TCPConnection {
+	return &TCPConnection{
 		conn:      conn,
 		closeChan: make(chan bool, 1),
 		writeChan: make(chan []byte, pendingMsgCount),
+		sendChan: make(chan []byte),
 		codec:     msgCodec,
+		id:	id,
 	}
-
-	c.waitGroup.Add(1)
-	go func() {
-		defer c.waitGroup.Done()
-		for {
-			select {
-			case msg, ok := <-c.writeChan:
-				if ok {
-					err := c.codec.Decodec(c.conn, msg)
-					if err != nil {
-						log.Printf("send data occur error: %v, connection: %v", err, c.conn.RemoteAddr())
-						c.Close()
-						return
-					}
-				}
-				case <-c.closeChan:
-					log.Printf("exit send go rutine, connection closed : %v", c.conn.RemoteAddr())
-					return
-			}
-		}
-	}()
-
-	return c
 }
 
+func (me *TCPConnection) start() {
+	loopers := [2]func(){me.writeLooper, me.readLooper}
+	for _, looper := range(loopers) {
+		me.waitGroup.Add(1)
+		go looper()
+	}
+}
+
+func (me *TCPConnection) writeLooper() {
+	defer me.waitGroup.Done()
+	for {
+		select {
+		case msg, ok := <-me.writeChan:
+			if ok {
+				err := me.codec.Decodec(me.conn, msg)
+				if err != nil {
+					log.Printf("send data occur error: %v, connection: %v", err, me.conn.RemoteAddr())
+					me.Close()
+					return
+				}
+			}
+		case <-me.closeChan:
+			log.Printf("exit send go rutine, connection closed : %v", me.conn.RemoteAddr())
+			return
+		}
+	}
+}
+
+func (me *TCPConnection) readLooper(){
+	defer me.waitGroup.Done()
+	for {
+		msgBuffer, err := me.getMessage()
+		if err != nil {
+			log.Printf("get message failed, error : %v\n", err)
+			me.Close()
+			break
+		}
+
+		select {
+			case <-me.closeChan:
+				log.Printf("exit read looper, connection : %s", me.RemoteAddr())
+				return
+			case me.sendChan<- msgBuffer:
+		}
+	}
+}
 // LocalAddr : get local addr
 func (c *TCPConnection) LocalAddr() net.Addr {
 	return c.conn.LocalAddr()
@@ -77,7 +105,7 @@ func (c *TCPConnection) SendMessage(message []byte) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if !c.IsClosed(){
+	if !c.IsClosed() {
 		select {
 		case c.writeChan <- message:
 			return nil
@@ -91,7 +119,7 @@ func (c *TCPConnection) SendMessage(message []byte) error {
 	}
 }
 
-func (c *TCPConnection) GetMessage() ([]byte, error) {
+func (c *TCPConnection) getMessage() ([]byte, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -107,6 +135,14 @@ func (c *TCPConnection) GetMessage() ([]byte, error) {
 	}
 
 	return message, err
+}
+
+func (me *TCPConnection) GetMesageChan() <- chan []byte {
+	return me.sendChan
+}
+
+func (me *TCPConnection) ConnectionId() uint32 {
+	return me.id
 }
 
 // Close : close tcp connection
