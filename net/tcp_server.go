@@ -1,33 +1,36 @@
 package net
 
 import (
-	"errors"
 	"log"
 	"net"
 	"sync"
 	"time"
-	"runtime"
 	"sync/atomic"
+	"context"
+	"bee/net/netutil"
+	"io"
 )
 
 type TCPServerConfig struct {
 	Addr             string
-	NewAgent         func(connection *TCPConnection) Agent
-	MsgCodec         MessageCodec
+	SteamFactory     CodecSteamFactory
+	AgentFactory     AgentFactory
 	PenddingMsgCount int
 	MaxConnCount     int
+	KeepaliveTimeout time.Duration
 }
 
 // TCPServer is a implement of the server conception, the server can accpet tcp connect
 // new Agent for the connect, manage the client connnects and the agent servcie lifetime
 type TCPServer struct {
 	config     TCPServerConfig
-	listenerWG sync.WaitGroup
-	listener   *net.TCPListener
+	listener   net.Listener
 	connsLock  sync.Mutex
-	connsWG    sync.WaitGroup
-	connsMap   map[uint32]*TCPConnection
-	nextClientId uint32
+	wg         sync.WaitGroup
+	ctx        context.Context
+	cancelFn   context.CancelFunc
+	connsMap   sync.Map
+	totalCount int32
 }
 
 // NewServer  new a server instance
@@ -40,8 +43,9 @@ func NewServer(config *TCPServerConfig) (*TCPServer, error) {
 		return nil, err
 	}
 
-	if s.config.NewAgent == nil {
-		return nil, errors.New("NewAgent can not be null")
+	if s.config.AgentFactory == nil {
+		log.Println("agent factory can not be nil")
+		return nil, err
 	}
 
 	if s.config.MaxConnCount == 0 {
@@ -54,8 +58,11 @@ func NewServer(config *TCPServerConfig) (*TCPServer, error) {
 		log.Println("invalid PenddingMsgCount, set to default ", s.config.PenddingMsgCount)
 	}
 
-	if s.config.MsgCodec == nil {
-		s.config.MsgCodec, _ = NewDefaultMessageReaderWriter(2, 4094)
+	if s.config.SteamFactory == nil {
+		s.config.SteamFactory = func (rw io.ReadWriter) CodecSteam {
+			coder, _:= NewHeadBodyCodec(rw,2, 4094)
+			return  coder
+		}
 	}
 
 	listener, err := net.ListenTCP("tcp", tcpAddr)
@@ -63,104 +70,84 @@ func NewServer(config *TCPServerConfig) (*TCPServer, error) {
 		return nil, err
 	}
 
-	s.listener = listener
-	s.connsMap = make(map[uint32]*TCPConnection)
-
+	s.listener = netutil.LimitListener(listener, s.config.MaxConnCount)
+	s.ctx, s.cancelFn = context.WithCancel(context.Background())
 	return s, nil
 }
 
 // Serve : block run the server
-func (s *TCPServer) Serve() {
-	s.listenerWG.Add(1)
-	defer s.listenerWG.Done()
+func (s *TCPServer) Serve() error {
+	s.wg.Wait()
+	defer s.wg.Done()
 
 	var retryInterval = time.Second
 	for {
-		conn, err := s.listener.AcceptTCP()
+		conn, err := s.listener.Accept()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
 				log.Printf("accept error : %v, retry in %v sec\n", err, retryInterval)
 				time.Sleep(retryInterval)
 				continue
 			} else {
-				return
+				return err
 			}
 		}
 
-		s.connsLock.Lock()
-		if len(s.connsMap) >= s.config.MaxConnCount {
-			s.connsLock.Unlock()
+		if int(s.GetConectionCount()) >= s.config.MaxConnCount {
 			conn.Close()
-			log.Println("max connection !!!")
+			log.Println("accept error : max connect exceed")
+			continue
 		}
-		id := s.genNextId()
-		tcpConn := newTCPConnection(id, conn, s.config.PenddingMsgCount, s.config.MsgCodec)
-		s.connsMap[id] = tcpConn
-		s.connsLock.Unlock()
 
-		agent := s.config.NewAgent(tcpConn)
-		s.connsWG.Add(1)
-		go func(){
-			defer func () {
-				s.connsWG.Done()
-				tcpConn.Close()
-				if err :=recover(); err != nil {
-					buf := make([]byte, 1024)
-					runtime.Stack(buf, true)
-					log.Printf("agent crash : %s", buf)
-				}
-			}()
+		s.startSession(conn)
+	}
+}
 
-			tcpConn.start()
-
-			agent.Init()
-			agent.Run()
-			agent.Destroy()
-
-			tcpConn.Close()
-
-			s.connsLock.Lock()
-			delete(s.connsMap, tcpConn.id)
-			s.connsLock.Unlock()
-		}()
+func (s *TCPServer) IsClosed() bool {
+	select {
+	case <-s.ctx.Done():
+		return true
+	default:
+		return false
 	}
 }
 
 // Close : close server
 func (s *TCPServer) Close() {
-	s.listener.Close()
-	s.listenerWG.Wait()
+	if s.IsClosed() {
+		return
+	}
 
 	s.connsLock.Lock()
-	for _, conn := range s.connsMap {
-		conn.Close()
-	}
-	s.connsMap = nil
+	s.cancelFn()
+	s.listener.Close()
 	s.connsLock.Unlock()
 
-	s.connsWG.Wait()
+	s.wg.Wait()
 }
 
-func (me *TCPServer) genNextId() uint32 {
-	for {
-		nextId := atomic.AddUint32(&me.nextClientId, 1)
-
-		me.connsLock.Lock()
-		if _, ok := me.connsMap[nextId]; !ok {
-			me.connsLock.Unlock()
-			return nextId
-		}
-		me.connsLock.Unlock()
-	}
+func (s *TCPServer) GetConectionCount() int32 {
+	return atomic.LoadInt32(&(s.totalCount))
 }
 
-func (me *TCPServer) GetTCPConnection(id uint32) (*TCPConnection, error) {
-	me.connsLock.Lock()
-	defer me.connsLock.Unlock()
-
-	if conn, ok := me.connsMap[id]; ok {
-		return conn, nil
+func (s *TCPServer) startSession(conn net.Conn) {
+	s.wg.Add(1)
+	opt := &tcpConnectionOption{
+		iosteam:          s.config.SteamFactory(conn),
+		agentFactory:     s.config.AgentFactory,
+		closeCallback:    s.removeSession,
+		maxWritePending : s.config.PenddingMsgCount,
+		keepaliveTimeout: s.config.KeepaliveTimeout,
 	}
+	tcpConn := newTCPConnection(s.ctx, conn, opt)
+	tcpConn.start()
 
-	return nil, errors.New("connection not found")
+	atomic.AddInt32(&(s.totalCount), 1)
+	s.connsMap.Store(tcpConn, struct{}{})
+}
+
+func (s *TCPServer) removeSession(conn *TCPConnection) {
+	s.wg.Done()
+	s.connsMap.Delete(conn)
+	atomic.AddInt32(&(s.totalCount), -1)
 }

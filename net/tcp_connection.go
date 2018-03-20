@@ -5,101 +5,46 @@ import (
 	"log"
 	"net"
 	"sync"
-	"github.com/lukehoban/ident"
+	"context"
+	"time"
 )
 
 var (
-	ErrorConnectClosed = errors.New("connect is close")
-	ErrorNullMessage   = errors.New("null message")
-	ErrorSendBlocked   = errors.New("send queue full")
+	ErrorConnectClosed    = errors.New("tcpconn: connect is close")
+	ErrorSendBlocked      = errors.New("tcpconn: send queue full")
+	ErrorCloseByPeer      = errors.New("tcpconn: close by peer")
+	ErrorKeepaliveTimeout = errors.New(("tcpconn: keepalive timeout"))
 )
 
-// TCPConnection implement the conception of connect, read msg, write msg
+type tcpConnectionOption struct {
+	iosteam         CodecSteam
+	agentFactory    AgentFactory
+	closeCallback   func(conn *TCPConnection)
+	maxWritePending int
+	keepaliveTimeout time.Duration
+}
+
+// TCPConnection wrap the under net.TCPConn. Read and write package from under tcp socket
 type TCPConnection struct {
-	waitGroup sync.WaitGroup
-	lock      sync.Mutex
-	conn      *net.TCPConn
-	closeChan chan bool
-	writeChan chan []byte
-	sendChan chan []byte
-	codec     MessageCodec
-	id 		uint32
+	opt        *tcpConnectionOption
+	ctx        context.Context
+	cancelFn   context.CancelFunc
+	once       sync.Once
+	wg         sync.WaitGroup
+	lock       sync.Mutex
+	conn       net.Conn
+	writeChan  chan []byte
+	closeError error
 }
 
-func newTCPConnection( id uint32,
-						conn *net.TCPConn,
-						pendingMsgCount int,
-						msgCodec MessageCodec) *TCPConnection {
-	return &TCPConnection{
-		conn:      conn,
-		closeChan: make(chan bool, 1),
-		writeChan: make(chan []byte, pendingMsgCount),
-		sendChan: make(chan []byte),
-		codec:     msgCodec,
-		id:	id,
-	}
-}
-
-func (me *TCPConnection) start() {
-	loopers := [2]func(){me.writeLooper, me.readLooper}
-	for _, looper := range(loopers) {
-		me.waitGroup.Add(1)
-		go looper()
-	}
-}
-
-func (me *TCPConnection) writeLooper() {
-	defer me.waitGroup.Done()
-	for {
-		select {
-		case msg, ok := <-me.writeChan:
-			if ok {
-				err := me.codec.Decodec(me.conn, msg)
-				if err != nil {
-					log.Printf("send data occur error: %v, connection: %v", err, me.conn.RemoteAddr())
-					me.Close()
-					return
-				}
-			}
-		case <-me.closeChan:
-			log.Printf("exit send go rutine, connection closed : %v", me.conn.RemoteAddr())
-			return
-		}
-	}
-}
-
-func (me *TCPConnection) readLooper(){
-	defer me.waitGroup.Done()
-	for {
-		msgBuffer, err := me.getMessage()
-		if err != nil {
-			log.Printf("get message failed, error : %v\n", err)
-			me.Close()
-			break
-		}
-
-		select {
-			case <-me.closeChan:
-				log.Printf("exit read looper, connection : %s", me.RemoteAddr())
-				return
-			case me.sendChan<- msgBuffer:
-		}
-	}
-}
-// LocalAddr : get local addr
-func (c *TCPConnection) LocalAddr() net.Addr {
-	return c.conn.LocalAddr()
-}
-
-// RemoteAddr : get remote addr
-func (c *TCPConnection) RemoteAddr() net.Addr {
-	return c.conn.RemoteAddr()
+func (c *TCPConnection) NetConn() net.Conn {
+	return c.conn
 }
 
 // SendMessage : send message to connection
-func (c *TCPConnection) SendMessage(message []byte) error {
-	if message == nil {
-		return ErrorNullMessage
+func (c *TCPConnection) WritePacket(message []byte) error {
+	if len(message) <= 0{
+		return nil
 	}
 
 	c.lock.Lock()
@@ -110,8 +55,7 @@ func (c *TCPConnection) SendMessage(message []byte) error {
 		case c.writeChan <- message:
 			return nil
 		default:
-			log.Printf("connection %s send qeueue is full, close it", c.RemoteAddr())
-			c.Close()
+			log.Printf("connection %s send qeueue is full, close it", c.conn.RemoteAddr())
 			return ErrorSendBlocked
 		}
 	} else {
@@ -119,54 +63,106 @@ func (c *TCPConnection) SendMessage(message []byte) error {
 	}
 }
 
-func (c *TCPConnection) getMessage() ([]byte, error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	if !c.IsClosed() {
-		return nil, ErrorConnectClosed
-	}
-
-	message, err := c.codec.Encodec(c.conn)
-	if err != nil {
-		log.Printf("get message failed: %v, connection: %v", err, c.conn.RemoteAddr())
-		c.Close()
-		return nil, err
-	}
-
-	return message, err
-}
-
-func (me *TCPConnection) GetMesageChan() <- chan []byte {
-	return me.sendChan
-}
-
-func (me *TCPConnection) ConnectionId() uint32 {
-	return me.id
-}
-
 // Close : close tcp connection
 func (c *TCPConnection) Close() {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.CloseWithError(nil)
+}
 
-	if !c.IsClosed() {
-		close(c.closeChan)
-
-		go func() {
-			log.Printf("exit connection : %v", c.conn.RemoteAddr())
-			c.waitGroup.Wait()
-			close(c.writeChan)
-			c.conn.Close()
-		}()
-	}
+func (c *TCPConnection) CloseWithError(err error) {
+	c.once.Do(func() {
+		c.closeError = err
+		c.opt.closeCallback(c)
+		c.cancelFn()
+		c.conn.Close()
+		c.wg.Wait()
+		close(c.writeChan)
+		log.Printf("exit connection : %v", c.conn.RemoteAddr())
+	})
 }
 
 func (c *TCPConnection) IsClosed() bool {
 	select {
-	case <-c.closeChan:
+	case <-c.ctx.Done():
 		return true
 	default:
 		return false
 	}
+}
+
+func newTCPConnection(parent context.Context,
+	conn net.Conn,
+	opt *tcpConnectionOption) *TCPConnection {
+
+	ctx, cancel := context.WithCancel(parent)
+
+	t := &TCPConnection{
+		opt:			opt,
+		ctx:           ctx,
+		cancelFn:      cancel,
+		conn:          conn,
+		writeChan:     make(chan []byte, opt.maxWritePending),
+	}
+
+	return t
+}
+
+func (c *TCPConnection) start() {
+	c.wg.Add(2)
+	loopers := [2]func(){c.writeLooper, c.readLooper}
+	for _, looper := range (loopers) {
+		go looper()
+	}
+}
+
+func (c *TCPConnection) writeLooper() {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.ctx.Done():
+			c.Close()
+			return
+		case msg, ok := <-c.writeChan:
+			if ok {
+				err := c.opt.iosteam.Write(msg)
+				if err != nil && !c.IsClosed(){
+					log.Printf("send data occur error: %v, connection: %v", err, c.conn.RemoteAddr())
+					c.CloseWithError(ErrorCloseByPeer)
+					return
+				}
+			}
+		}
+	}
+}
+
+func (c *TCPConnection) readLooper() {
+	agent := c.opt.agentFactory(c)
+	defer c.wg.Done()
+	coder := c.opt.iosteam
+	for {
+		if (c.opt.keepaliveTimeout != 0) {
+			c.conn.SetReadDeadline(time.Now().Add(c.opt.keepaliveTimeout))
+		}
+
+		message, err := coder.Read()
+		if err != nil && !c.IsClosed() {
+			log.Println("unpack message failed, error:", err)
+
+			if netErr, ok:= err.(net.Error); ok && netErr.Timeout() {
+				c.CloseWithError(ErrorKeepaliveTimeout)
+			} else {
+				c.CloseWithError(ErrorCloseByPeer)
+			}
+			break
+		}
+
+		select {
+		case <-c.ctx.Done():
+			break
+		default:
+			agent.OnMessage(message)
+		}
+	}
+
+	agent.OnDestroy()
+	c.Close()
 }
